@@ -489,6 +489,25 @@ internal partial class Program
             else A("New Session", "", () => CreateSession(Guid.NewGuid().ToString(), null, null, cws, true));
             if (IsElevated()) A("New Non-Elevated Session", "", () => CreateSession(Guid.NewGuid().ToString(), null, null, cws, true, deElevate: true));
             A("Open Directory…", "", () => { var d = PickFolder(); if (d is not null) CreateSession(Guid.NewGuid().ToString(), null, d, cws, true); });
+            A("Set Default Directory…", "", () =>
+            {
+                var d = PickFolder(cws.DefaultDir);
+                if (d is null) return;
+                if (!TrySetWorkspaceDefaultDir(cws, d, out _))
+                {
+                    ShowToast(WorkspaceDefaultDirs.NotDirectory);
+                    return;
+                }
+                SaveState();
+                ShowToast("Default directory: " + cws.DefaultDir);
+            });
+            if (!string.IsNullOrEmpty(cws.DefaultDir))
+                A("Clear Default Directory", "", () =>
+                {
+                    TrySetWorkspaceDefaultDir(cws, null, out _);
+                    SaveState();
+                    ShowToast("Default directory cleared");
+                });
             A("Rename", "", () => StartRename(cws));
             A(wsFocused ? "Unfocus" : "Focus", "", () => WorkspaceFocusOp(wsFocused ? "off" : "on", cws.Id));
             if (wsCount > 1) { list.Add(MenuSeparator()); A("Delete Workspace", "", () => DeleteWorkspace(cws)); }
@@ -651,21 +670,50 @@ internal partial class Program
         return true;
     }
 
-    /// <summary>Modal folder picker (native shell). Returns the chosen path or null.</summary>
-    private string? PickFolder()
+    private static readonly BrowseFolderCallback s_browseFolderCallback = BrowseFolderCallbackImpl;
+
+    private static int BrowseFolderCallbackImpl(IntPtr hwnd, uint uMsg, IntPtr lParam, IntPtr lpData)
     {
-        var bi = new BROWSEINFO
+        if (uMsg == BFFM_INITIALIZED && lpData != IntPtr.Zero)
+            SendMessageW(hwnd, BFFM_SETSELECTIONW, (IntPtr)1, lpData);
+        return 0;
+    }
+
+    /// <summary>Modal folder picker (native shell). Returns the chosen path or null.
+    /// <paramref name="initialDir"/> opens the dialog on that folder when it still exists.</summary>
+    private string? PickFolder(string? initialDir = null)
+    {
+        IntPtr initialPtr = IntPtr.Zero;
+        try
         {
-            hwndOwner = _hwnd,
-            lpszTitle = "Open Directory",
-            ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
-        };
-        IntPtr pidl = SHBrowseForFolderW(ref bi);
-        if (pidl == IntPtr.Zero) return null;
-        var sb = new StringBuilder(260);
-        bool ok = SHGetPathFromIDListW(pidl, sb);
-        CoTaskMemFree(pidl);
-        return ok && sb.Length > 0 ? sb.ToString() : null;
+            if (!string.IsNullOrWhiteSpace(initialDir))
+            {
+                try
+                {
+                    string full = Path.GetFullPath(initialDir);
+                    if (Directory.Exists(full)) initialPtr = Marshal.StringToHGlobalUni(full);
+                }
+                catch { }
+            }
+            var bi = new BROWSEINFO
+            {
+                hwndOwner = _hwnd,
+                lpszTitle = "Open Directory",
+                ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
+                lpfn = initialPtr != IntPtr.Zero ? Marshal.GetFunctionPointerForDelegate(s_browseFolderCallback) : IntPtr.Zero,
+                lParam = initialPtr,
+            };
+            IntPtr pidl = SHBrowseForFolderW(ref bi);
+            if (pidl == IntPtr.Zero) return null;
+            var sb = new StringBuilder(260);
+            bool ok = SHGetPathFromIDListW(pidl, sb);
+            CoTaskMemFree(pidl);
+            return ok && sb.Length > 0 ? sb.ToString() : null;
+        }
+        finally
+        {
+            if (initialPtr != IntPtr.Zero) Marshal.FreeHGlobal(initialPtr);
+        }
     }
 
     // ---- Agent attention (title-bar bell + jump-to-next) ----
@@ -1360,11 +1408,15 @@ internal partial class Program
     private void AdjustClientRect(IntPtr hwnd, IntPtr lParam)
     {
         // When maximized, inset by the frame so content isn't pushed off-screen / under the taskbar.
+        // Windows hangs a maximized window past the monitor by the frame at the WINDOW's DPI; measured
+        // at any other DPI the inset misses it, and a strip of DWM caption shows along the top.
         if (IsZoomed(hwnd))
         {
             var rc = Marshal.PtrToStructure<RECT>(lParam);
-            int fx = GetSystemMetrics(SM_CXFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
-            int fy = GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER);
+            uint dpi = GetDpiForWindow(hwnd);
+            int pad = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+            int fx = GetSystemMetricsForDpi(SM_CXFRAME, dpi) + pad;
+            int fy = GetSystemMetricsForDpi(SM_CYFRAME, dpi) + pad;
             rc.left += fx; rc.right -= fx; rc.top += fy; rc.bottom -= fy;
             Marshal.StructureToPtr(rc, lParam, false);
         }
